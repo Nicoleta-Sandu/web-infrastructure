@@ -1,0 +1,262 @@
+version: '3.8'
+
+services:
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: web_nginx
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - frontend
+    volumes:
+      # Use a bind-mount to save logs to host, redirected from /tmp inside container
+      - ./logs/nginx:/host_logs
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:exec,uid=1000,gid=1000,mode=1777
+      - /var/cache/nginx:uid=1000,gid=1000,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    # Use entrypoint to set up log redirection from /tmp to mounted volume
+    entrypoint: >
+      /bin/sh -c "
+      mkdir -p /host_logs &&
+      ln -sf /host_logs/app_access.log /tmp/app_access.log &&
+      ln -sf /host_logs/app_error.log /tmp/app_error.log &&
+      ln -sf /host_logs/access.log /tmp/access.log &&
+      ln -sf /host_logs/error.log /tmp/error.log &&
+      /docker-entrypoint.sh nginx -g 'daemon off;'
+      "
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: web_backend
+    environment:
+      - DB_HOST=postgres
+      - DB_NAME=appdb
+      - DB_USER=app_user
+      - DB_PASSWORD=secure_password
+      - FLASK_APP=app.py
+      - FLASK_ENV=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    volumes:
+      - backend_logs:/var/log/app
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.7'
+          memory: 512M
+
+  postgres:
+    build:
+      context: ./database
+      dockerfile: Dockerfile
+    container_name: web_postgres
+    environment:
+      - POSTGRES_PASSWORD=postgres_password
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+
+  prometheus:
+    image: prom/prometheus:v2.43.0
+    container_name: web_prometheus
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/rules.yml:/etc/prometheus/rules.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring
+      - frontend
+      - backend
+    depends_on:
+      - nginx
+      - backend
+      - postgres
+    restart: unless-stopped
+    user: "65534:65534" # nobody:nobody
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  node_exporter:
+    image: prom/node-exporter:v1.5.0
+    container_name: web_node_exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    networks:
+      - monitoring
+    restart: unless-stopped
+    user: "65534:65534" # nobody:nobody
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  postgres_exporter:
+    image: prometheuscommunity/postgres-exporter:v0.12.0
+    container_name: web_postgres_exporter
+    environment:
+      - DATA_SOURCE_NAME=postgresql://postgres:postgres_password@postgres:5432/postgres?sslmode=disable
+    ports:
+      - "9187:9187"
+    networks:
+      - monitoring
+      - backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    user: "65534:65534" # nobody:nobody
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  nginx_exporter:
+    image: nginx/nginx-prometheus-exporter:0.11.0
+    container_name: web_nginx_exporter
+    command:
+      - '-nginx.scrape-uri=http://nginx/nginx_status'
+    ports:
+      - "9113:9113"
+    networks:
+      - monitoring
+      - frontend
+    depends_on:
+      nginx:
+        condition: service_healthy
+    restart: unless-stopped
+    user: "65534:65534" # nobody:nobody
+    read_only: true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  grafana:
+    image: grafana/grafana:9.5.1
+    container_name: web_grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=secure_grafana_password
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    user: "472:472" # grafana user
+    read_only: false
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+  monitoring:
+    driver: bridge
+
+volumes:
+  nginx_logs:
+  backend_logs:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
