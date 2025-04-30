@@ -1,0 +1,318 @@
+---
+# Playbook for setting up a web server with Docker and Docker Compose
+- name: Setup Web Infrastructure Server
+  hosts: web_servers
+  become: true  # Use sudo
+  gather_facts: yes  # Make sure we get OS info
+  
+  vars:
+    docker_compose_version: "v2.24.0"  # Latest stable version as of April 2025
+    
+  tasks:
+    - name: Check Ubuntu version
+      debug:
+        msg: "Running on Ubuntu {{ ansible_distribution_version }}"
+    
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600  # Update if cache is older than 1 hour
+      
+    - name: Upgrade all packages
+      apt:
+        upgrade: dist
+        
+    - name: Install required system packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - python3-pip
+          - virtualenv
+          - ufw
+
+    # Uninstall any existing Docker installations
+    - name: Remove old Docker installations if they exist
+      apt:
+        name: "{{ packages }}"
+        state: absent
+      vars:
+        packages:
+          - docker
+          - docker.io
+          - containerd
+          - runc
+          - docker-compose
+    
+    # Use official Docker repository instead of script
+    - name: Add Docker GPG apt Key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+        
+    - name: Install Docker packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+    
+    # Configure Docker to start on boot
+    - name: Start and enable Docker service
+      service:
+        name: docker
+        state: started
+        enabled: yes
+    
+    # Install Docker Compose v2
+    - name: Install Docker Compose
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-linux-x86_64"
+        dest: "/usr/local/bin/docker-compose"
+        mode: '0755'
+        force: yes
+    
+    - name: Verify correct permissions on docker-compose
+      file:
+        path: "/usr/local/bin/docker-compose"
+        mode: '0755'
+        state: file
+    
+    - name: Create symbolic link for docker-compose
+      file:
+        src: "/usr/local/bin/docker-compose"
+        dest: "/usr/bin/docker-compose"
+        state: link
+        force: yes
+    
+    - name: Create symbolic link for docker-compose (alternative location)
+      file:
+        src: "/usr/local/bin/docker-compose"
+        dest: "/usr/local/sbin/docker-compose"
+        state: link
+        force: yes
+    
+    - name: Verify Docker installation
+      command: docker --version
+      register: docker_version
+      changed_when: false
+      
+    - name: Show Docker version
+      debug:
+        var: docker_version.stdout
+      failed_when: docker_version.rc != 0
+        
+    - name: Verify Docker Compose installation
+      command: /usr/local/bin/docker-compose --version
+      register: compose_version
+      changed_when: false
+      
+    - name: Show Docker Compose version
+      debug:
+        var: compose_version.stdout
+      failed_when: compose_version.rc != 0
+    
+    # Add docker to system-wide PATH in multiple locations to ensure it's always available
+    - name: Ensure Docker is in system PATH
+      lineinfile:
+        path: "/etc/environment"
+        regexp: '^PATH='
+        line: 'PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"'
+        state: present
+    
+    # Setup current user for Docker
+    - name: Create docker group if it doesn't exist
+      group:
+        name: docker
+        state: present
+    
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+    
+    # Apply Docker group permissions immediately
+    - name: Set ownership on Docker socket
+      file:
+        path: /var/run/docker.sock
+        mode: '0666'
+        state: file
+    
+    # Create directories for application
+    - name: Create application directory
+      file:
+        path: /opt/web-infrastructure
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+    
+    - name: Create logs directory
+      file:
+        path: /opt/web-infrastructure/logs
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+        
+    - name: Create monitoring directory
+      file:
+        path: /opt/web-infrastructure/monitoring
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+    
+    # Configure ufw firewall
+    - name: Allow SSH connections
+      ufw:
+        rule: allow
+        name: OpenSSH
+    
+    - name: Allow HTTP traffic
+      ufw:
+        rule: allow
+        port: '80'
+        proto: tcp
+    
+    - name: Allow HTTPS traffic
+      ufw:
+        rule: allow
+        port: '443'
+        proto: tcp
+    
+    - name: Allow Grafana traffic
+      ufw:
+        rule: allow
+        port: '3000'
+        proto: tcp
+    
+    - name: Allow Prometheus traffic
+      ufw:
+        rule: allow
+        port: '9090'
+        proto: tcp
+    
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: deny
+    
+    # System configuration
+    - name: Increase system limits for Docker
+      pam_limits:
+        domain: '*'
+        limit_type: "{{ item.limit_type }}"
+        limit_item: "{{ item.limit_item }}"
+        value: "{{ item.value }}"
+      loop:
+        - { limit_type: soft, limit_item: nofile, value: 65536 }
+        - { limit_type: hard, limit_item: nofile, value: 65536 }
+    
+    - name: Set sysctl parameters
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+        - { name: 'vm.max_map_count', value: '262144' }
+        - { name: 'fs.file-max', value: '65536' }
+    
+    # Add Docker PATH to global profile
+    - name: Add Docker to system-wide profile
+      copy:
+        dest: /etc/profile.d/docker-path.sh
+        content: |
+          # Add Docker binaries to PATH
+          export PATH=$PATH:/usr/bin:/usr/local/bin
+        mode: '0644'
+    
+    # Add Docker PATH to bashrc for all users
+    - name: Add Docker to PATH in user bashrc
+      blockinfile:
+        path: "/home/{{ ansible_user }}/.bashrc"
+        block: |
+          # Docker path settings
+          export PATH=$PATH:/usr/bin:/usr/local/bin
+          alias docker-compose="/usr/local/bin/docker-compose"
+        state: present
+        create: yes
+      become: yes
+      become_user: "{{ ansible_user }}"
+    
+    # Create a test script to verify docker works
+    - name: Create docker test script
+      copy:
+        dest: /opt/web-infrastructure/test-docker.sh
+        content: |
+          #!/bin/bash
+          echo "PATH is: $PATH"
+          echo "Docker location: $(which docker)"
+          echo "Docker version: $(docker --version)"
+          echo "Docker Compose location: $(which docker-compose)"
+          echo "Docker Compose version: $(docker-compose --version)"
+          
+          echo "Testing Docker..."
+          docker run --rm hello-world
+          
+          echo "Testing Docker Compose..."
+          cd /opt/web-infrastructure
+          echo "version: '3'" > test-compose.yml
+          echo "services:" >> test-compose.yml
+          echo "  hello:" >> test-compose.yml
+          echo "    image: hello-world" >> test-compose.yml
+          docker-compose -f test-compose.yml up
+          rm test-compose.yml
+          
+          echo "All tests completed successfully!"
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+    
+    # Actually run the test script to ensure everything works
+    - name: Execute Docker test script
+      command: /opt/web-infrastructure/test-docker.sh
+      become: yes
+      become_user: "{{ ansible_user }}"
+      environment:
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      register: docker_test_result
+    
+    - name: Show Docker test results
+      debug:
+        var: docker_test_result.stdout_lines
+      failed_when: docker_test_result.rc != 0
+        
+    # Create a flag file to indicate successful provisioning
+    - name: Create provisioned flag file
+      file:
+        path: /opt/web-infrastructure/.provisioned
+        state: touch
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      
+    # Reboot server if required
+    - name: Reboot server if required
+      reboot:
+        reboot_timeout: 600
+      when: ansible_facts.packages['linux-image-generic'][0].version != ansible_kernel

@@ -1,0 +1,273 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  provision:
+    name: Provision Server with Ansible
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ansible
+      
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: Run Ansible playbook
+        run: |
+          export SSH_HOST=${{ secrets.SSH_HOST }}
+          export SSH_USERNAME=${{ secrets.SSH_USERNAME }}
+          ansible-playbook -i ansible/inventory.ini ansible/server-setup.yml -vv
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: false
+          
+      # Simple SSH test to verify basic connectivity
+      - name: Verify SSH connectivity
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            echo "SSH connection successful"
+            whoami
+            pwd
+          
+      # Verify Docker is installed on remote server with all required environment 
+      - name: Verify Docker installation on server
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            # Print environment debug information
+            echo "Current user: $(whoami)"
+            echo "Current directory: $(pwd)"
+            echo "PATH: $PATH"
+            
+            # Source all possible profile files
+            source ~/.profile || true
+            source ~/.bashrc || true
+            source /etc/profile || true
+            
+            echo "PATH after sourcing profiles: $PATH"
+            
+            # Find docker and add to path if needed
+            if [ ! -x "$(command -v docker)" ]; then
+              for path in /usr/bin/docker /usr/local/bin/docker; do
+                if [ -x "$path" ]; then
+                  export PATH="$PATH:$(dirname $path)"
+                  echo "Added $(dirname $path) to PATH"
+                  break
+                fi
+              done
+            fi
+            
+            # Find docker-compose and add to path if needed
+            if [ ! -x "$(command -v docker-compose)" ]; then
+              for path in /usr/bin/docker-compose /usr/local/bin/docker-compose; do
+                if [ -x "$path" ]; then
+                  export PATH="$PATH:$(dirname $path)"
+                  echo "Added $(dirname $path) to PATH"
+                  break
+                fi
+              done
+            fi
+            
+            # Verify Docker installation using absolute paths if needed
+            if command -v docker &> /dev/null; then
+              echo "Docker is installed and in PATH"
+              docker --version
+            elif [ -x "/usr/bin/docker" ]; then
+              echo "Docker found at /usr/bin/docker"
+              /usr/bin/docker --version
+            elif [ -x "/usr/local/bin/docker" ]; then
+              echo "Docker found at /usr/local/bin/docker"
+              /usr/local/bin/docker --version
+            else
+              echo "Docker not found in standard locations"
+              ls -la /usr/bin | grep docker || echo "No docker in /usr/bin"
+              ls -la /usr/local/bin | grep docker || echo "No docker in /usr/local/bin"
+              find /usr -name docker 2>/dev/null || echo "Docker executable not found"
+              exit 1
+            fi
+            
+            # Verify Docker Compose installation using absolute paths if needed
+            if command -v docker-compose &> /dev/null; then
+              echo "Docker Compose is installed and in PATH"
+              docker-compose --version
+            elif [ -x "/usr/bin/docker-compose" ]; then
+              echo "Docker Compose found at /usr/bin/docker-compose"
+              /usr/bin/docker-compose --version
+            elif [ -x "/usr/local/bin/docker-compose" ]; then
+              echo "Docker Compose found at /usr/local/bin/docker-compose"
+              /usr/local/bin/docker-compose --version
+            else
+              echo "Docker Compose not found in standard locations"
+              ls -la /usr/bin | grep docker-compose || echo "No docker-compose in /usr/bin"
+              ls -la /usr/local/bin | grep docker-compose || echo "No docker-compose in /usr/local/bin"
+              find /usr -name docker-compose 2>/dev/null || echo "Docker Compose executable not found"
+              exit 1
+            fi
+            
+            # Fix docker socket permissions if needed
+            if [ ! -w "/var/run/docker.sock" ]; then
+              echo "Setting permissions on docker socket"
+              sudo chmod 666 /var/run/docker.sock
+            fi
+            
+            # Test Docker with hello-world image using appropriate command
+            if command -v docker &> /dev/null; then
+              docker run --rm hello-world
+            elif [ -x "/usr/bin/docker" ]; then
+              /usr/bin/docker run --rm hello-world
+            elif [ -x "/usr/local/bin/docker" ]; then
+              /usr/local/bin/docker run --rm hello-world
+            else
+              echo "Cannot run Docker hello-world test"
+              exit 1
+            fi
+            
+            echo "All Docker verification tests passed successfully!"
+            
+  build:
+    name: Build and Push Docker Images
+    needs: provision
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
+            type=sha,format=short
+      
+      # Build and push Nginx image
+      - name: Build and push Nginx image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./nginx
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-nginx:latest,${{ secrets.DOCKERHUB_USERNAME }}/web-infra-nginx:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-nginx:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-nginx:buildcache,mode=max
+      
+      # Build and push Backend image
+      - name: Build and push Backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-backend:latest,${{ secrets.DOCKERHUB_USERNAME }}/web-infra-backend:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-backend:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-backend:buildcache,mode=max
+      
+      # Build and push Postgres image
+      - name: Build and push Postgres image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./database
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-postgres:latest,${{ secrets.DOCKERHUB_USERNAME }}/web-infra-postgres:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-postgres:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/web-infra-postgres:buildcache,mode=max
+
+  deploy:
+    name: Deploy to Production Server
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      # Create production docker-compose file with image references
+      - name: Update docker-compose.yml for production
+        run: |
+          sed -i "s|build:|# build:|g" docker-compose.yaml
+          sed -i "s|context: ./nginx|image: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-nginx:latest|g" docker-compose.yaml
+          sed -i "s|context: ./backend|image: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-backend:latest|g" docker-compose.yaml
+          sed -i "s|context: ./database|image: ${{ secrets.DOCKERHUB_USERNAME }}/web-infra-postgres:latest|g" docker-compose.yaml
+          sed -i "s|dockerfile: Dockerfile|# dockerfile: Dockerfile|g" docker-compose.yaml
+          cat docker-compose.yaml > docker-compose.prod.yaml
+      
+      # Upload docker-compose.prod.yaml to remote server
+      - name: Copy docker-compose file to server
+        uses: appleboy/scp-action@v0.1.10
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.prod.yaml,monitoring/"
+          target: "/opt/web-infrastructure"
+      
+      # Deploy using docker-compose on the remote server with enhanced environment setup
+      - name: Deploy with docker-compose
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            # Source profile files to get updated PATH
+            source ~/.profile 2>/dev/null || true
+            source ~/.bashrc 2>/dev/null || true
+            source /etc/profile 2>/dev/null || true
+            
+            cd /opt/web-infrastructure
+            mkdir -p logs/nginx
+            
+            # Fix docker socket permissions if needed
+            if [ ! -w "/var/run/docker.sock" ]; then
+              echo "Setting permissions on docker socket"
+              sudo chmod 666 /var/run/docker.sock
+            fi
+            
+            # Use absolute paths to be safe
+            echo "Pulling Docker images..."
+            sudo /usr/local/bin/docker-compose -f docker-compose.prod.yaml pull
+            
+            echo "Starting containers..."
+            sudo /usr/local/bin/docker-compose -f docker-compose.prod.yaml up -d
+            
+            echo "Cleaning up old images..."
+            sudo /usr/bin/docker system prune -af --volumes
+            
+            echo "Checking container status..."
+            sudo /usr/bin/docker ps
