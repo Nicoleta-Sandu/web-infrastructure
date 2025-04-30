@@ -280,3 +280,102 @@ Three isolated Docker networks are used:
 - `frontend`: Connects Nginx and the Backend
 - `backend`: Connects Backend and PostgreSQL
 - `monitoring`: Connects all monitoring components
+
+## CI/CD Pipeline
+
+The CI/CD pipeline automates the following processes:
+1. Provisioning the server with necessary software and configurations
+2. Building Docker images for all services
+3. Pushing images to Docker Hub
+4. Deploying the application to the production server
+
+### Components
+
+The CI/CD pipeline consists of the following components:
+
+#### 1. GitHub Actions Workflow
+
+The GitHub Actions workflow file (`.github/workflows/build-deploy.yml`) defines the CI/CD pipeline and is triggered on push to the `main` branch.
+
+The workflow has three main jobs:
+
+##### 1.1 Provision Job
+- Sets up the server using Ansible
+- Installs and configures Docker, Docker Compose, and other dependencies
+- Configures system parameters and firewall settings
+
+##### 1.2 Build Job
+- Builds Docker images for nginx, backend, and postgres services
+- Tags images with both latest and commit SHA
+- Pushes images to Docker Hub
+- Uses layer caching to speed up builds
+
+##### 1.3 Deploy Job
+- Creates a production-ready docker-compose file
+- Uploads the docker-compose file to the production server
+- Executes the deployment on the remote server using SSH
+
+#### 2. Ansible Playbook
+
+The Ansible playbook (`ansible/server-setup.yml`) handles server provisioning:
+- Updates system packages
+- Installs Docker and Docker Compose
+- Sets up necessary directories and permissions
+- Configures firewall rules
+- Optimizes system settings for Docker
+
+### Setup Instructions
+
+#### Prerequisites
+
+1. A GitHub repository with your application code
+2. A Docker Hub account
+3. A server with SSH access
+
+#### Required GitHub Secrets
+
+The following secrets need to be configured in your GitHub repository:
+
+| Secret Name | Description |
+|-------------|-------------|
+| `DOCKERHUB_USERNAME` | Your Docker Hub username |
+| `DOCKERHUB_TOKEN` | Your Docker Hub access token |
+| `SSH_HOST` | The IP address or hostname of your server |
+| `SSH_USERNAME` | The SSH username for your server |
+| `SSH_PRIVATE_KEY` | The private SSH key for connecting to your server |
+
+### Troubleshooting
+
+#### Common Issues
+
+1. **Failed Docker Build**
+   - Check the build logs in GitHub Actions
+   - Ensure Dockerfiles are correct and dependencies are available
+
+2. **Failed Deployment**
+   - Verify SSH connection details
+   - Check if Docker Hub credentials are valid
+   - Ensure the server has enough disk space and memory
+
+3. **Server Provisioning Failures**
+   - Check Ansible logs in GitHub Actions
+   - Ensure the server is accessible via SSH
+   - Verify the server meets the minimum requirements
+
+#### Checking Deployment Status
+
+To check the status of your deployment on the server:
+
+```bash
+# Connect to the server
+ssh your_username@your_server_ip
+
+# Go to the application directory
+cd /opt/web-infrastructure
+
+# Check running containers
+docker-compose -f docker-compose.prod.yaml ps
+
+# Check container logs
+docker-compose -f docker-compose.prod.yaml logs -f
+```
